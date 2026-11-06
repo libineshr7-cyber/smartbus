@@ -176,67 +176,64 @@ export default function BusQrTripStarter({
     setGpsStatus('requesting');
     toast.info('Acquiring real-time satellite GPS coordinates from device...');
 
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        // Location Permission Granted!
-        setGpsStatus('granted');
-        const lat = pos.coords.latitude;
-        const lng = pos.coords.longitude;
-        const spd = pos.coords.speed ? Math.round(pos.coords.speed * 3.6) : 0;
-        const hdg = pos.coords.heading || 0;
-        const acc = pos.coords.accuracy ? Math.round(pos.coords.accuracy) : 5;
+    const onLocationSuccess = (pos: GeolocationPosition) => {
+      setGpsStatus('granted');
+      const lat = pos.coords.latitude;
+      const lng = pos.coords.longitude;
+      const spd = pos.coords.speed && pos.coords.speed > 0 ? Math.round(pos.coords.speed * 3.6) : 0;
+      const hdg = pos.coords.heading && !isNaN(pos.coords.heading) ? pos.coords.heading : 0;
+      const acc = pos.coords.accuracy ? Math.round(pos.coords.accuracy) : 5;
 
-        setLiveLocation([lat, lng]);
-        setLiveSpeed(spd);
-        setGpsAccuracy(acc);
+      setLiveLocation([lat, lng]);
+      setLiveSpeed(spd);
+      setGpsAccuracy(acc);
 
-        // Update central bus store with real-time GPS telemetry
-        busStore.startTrip(route.id, driverName.trim(), driverPhone.trim());
-        busStore.updateBusLocation(route.id, [lat, lng], spd, hdg);
+      // Update central bus store & broadcast over cloud relay
+      busStore.startTrip(route.id, driverName.trim(), driverPhone.trim());
+      busStore.updateBusLocation(route.id, [lat, lng], spd, hdg);
 
-        setIsBroadcasting(true);
-        setElapsedSeconds(0);
+      setIsBroadcasting((prev) => {
+        if (!prev) {
+          toast.success(
+            `🛰️ Real-Time GPS Active! Transmitting live satellite coordinates for Route ${route.routeNumber}.`
+          );
+          onTripStarted?.(route.id);
+        }
+        return true;
+      });
+    };
 
-        // Begin continuous real-time device GPS watch
-        watchIdRef.current = navigator.geolocation.watchPosition(
-          (watchPos) => {
-            const wLat = watchPos.coords.latitude;
-            const wLng = watchPos.coords.longitude;
-            const wSpd = watchPos.coords.speed ? Math.round(watchPos.coords.speed * 3.6) : 0;
-            const wHdg = watchPos.coords.heading || 0;
-            const wAcc = watchPos.coords.accuracy ? Math.round(watchPos.coords.accuracy) : 5;
-
-            setLiveLocation([wLat, wLng]);
-            setLiveSpeed(wSpd);
-            setGpsAccuracy(wAcc);
-            busStore.updateBusLocation(route.id, [wLat, wLng], wSpd, wHdg);
-          },
-          (watchErr) => {
-            console.warn('Real-time GPS continuous watch warning:', watchErr);
-          },
-          {
-            enableHighAccuracy: true,
-            maximumAge: 1000,
-            timeout: 20000
-          }
-        );
-
-        toast.success(
-          `🛰️ Real-Time GPS Active! Transmitting live coordinates for Route ${route.routeNumber} (${route.routeName}).`
-        );
-        onTripStarted?.(route.id);
-      },
-      (err) => {
-        console.warn('Real-time Geolocation error:', err);
+    const onLocationError = (err: GeolocationPositionError) => {
+      console.warn('Real-time Geolocation notice:', err);
+      if (err.code === 1) {
         setGpsStatus('denied');
-        toast.error(`GPS Error: ${err.message}. Device GPS permission is required for real-time tracking.`);
-      },
+        toast.error('Location permission was denied. Please allow location access in your device/browser settings.');
+      } else if (err.code === 3) {
+        // High-accuracy timeout indoors; fallback to cellular/Wi-Fi fix
+        navigator.geolocation.getCurrentPosition(
+          onLocationSuccess,
+          (fallbackErr) => {
+            setGpsStatus('denied');
+            toast.error(`GPS Error: ${fallbackErr.message}. Ensure location is enabled.`);
+          },
+          { enableHighAccuracy: false, timeout: 10000, maximumAge: 10000 }
+        );
+      } else {
+        toast.error(`GPS Notice: ${err.message}. Retrying satellite lock...`);
+      }
+    };
+
+    // Start continuous tracking immediately
+    const watchId = navigator.geolocation.watchPosition(
+      onLocationSuccess,
+      onLocationError,
       {
         enableHighAccuracy: true,
-        timeout: 15000,
-        maximumAge: 0
+        timeout: 12000,
+        maximumAge: 3000
       }
     );
+    watchIdRef.current = watchId;
   };
 
   // STOP SHARING GPS & CONCLUDE TRIP

@@ -1,6 +1,8 @@
 // Prathyusha Engineering College - Smart Bus Central State Management
 // Official 2026 Routes & Boarding Points from PEC Transport Schedule (32 Stage-Wise Routes)
 import { REAL_ROAD_PATHS } from './realRoadData';
+import { getDistanceMeters } from './routeSimulation';
+import mqtt, { type MqttClient } from 'mqtt';
 
 export interface BusStop {
   name: string;
@@ -4051,8 +4053,15 @@ function initializeDefaultRoute(r: BusRoute): BusRoute {
   };
 }
 
+const MQTT_BROKER = 'wss://broker.emqx.io:8084/mqtt';
+const TOPIC_GPS = 'pec/smartbus/gps/';
+const TOPIC_TRIP = 'pec/smartbus/trip/';
+const TOPIC_SOS = 'pec/smartbus/sos/';
+
 class BusStore {
   private listeners: Set<() => void> = new Set();
+  private mqttClient: MqttClient | null = null;
+  public isCloudConnected: boolean = false;
 
   constructor() {
     if (typeof window !== 'undefined') {
@@ -4061,6 +4070,122 @@ class BusStore {
           this.notify();
         }
       });
+      this.initCloudSync();
+    }
+  }
+
+  private initCloudSync(): void {
+    try {
+      const clientId = `pec_bus_${Math.random().toString(36).substring(2, 9)}`;
+      this.mqttClient = mqtt.connect(MQTT_BROKER, {
+        clientId,
+        clean: true,
+        connectTimeout: 8000,
+        reconnectPeriod: 4000,
+        keepalive: 30
+      });
+
+      this.mqttClient.on('connect', () => {
+        this.isCloudConnected = true;
+        this.mqttClient?.subscribe([`${TOPIC_GPS}+`, `${TOPIC_TRIP}+`, `${TOPIC_SOS}+`]);
+      });
+
+      this.mqttClient.on('message', (topic, message) => {
+        try {
+          const data = JSON.parse(message.toString());
+          if (topic.startsWith(TOPIC_GPS)) {
+            const routeId = topic.replace(TOPIC_GPS, '');
+            this.handleRemoteGps(routeId, data);
+          } else if (topic.startsWith(TOPIC_TRIP)) {
+            const routeId = topic.replace(TOPIC_TRIP, '');
+            this.handleRemoteTrip(routeId, data);
+          } else if (topic.startsWith(TOPIC_SOS)) {
+            this.handleRemoteSos(data);
+          }
+        } catch {
+          // ignore malformed payloads
+        }
+      });
+
+      this.mqttClient.on('close', () => {
+        this.isCloudConnected = false;
+      });
+
+      this.mqttClient.on('error', () => {
+        this.isCloudConnected = false;
+      });
+    } catch {
+      // safe fallback if network offline
+    }
+  }
+
+  private publishCloud(topic: string, data: any): void {
+    try {
+      if (this.mqttClient && this.mqttClient.connected) {
+        this.mqttClient.publish(topic, JSON.stringify(data), { qos: 0 });
+      }
+    } catch {
+      // ignore network errors
+    }
+  }
+
+  private handleRemoteGps(routeId: string, data: any): void {
+    if (!data || !Array.isArray(data.location)) return;
+    const routes = this.getRoutes();
+    const idx = routes.findIndex((r) => r.id === routeId);
+    if (idx !== -1) {
+      routes[idx].status = 'active';
+      routes[idx].currentLocation = data.location;
+      if (typeof data.speed === 'number') routes[idx].speedKmH = data.speed;
+      if (typeof data.heading === 'number') routes[idx].heading = data.heading;
+      routes[idx].lastUpdated = data.timestamp || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+      // Update stop passed status dynamically
+      routes[idx].stops.forEach((stop) => {
+        const d = getDistanceMeters(data.location[0], data.location[1], stop.location[0], stop.location[1]);
+        if (d < 300 && !stop.passed) {
+          stop.passed = true;
+        }
+      });
+
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(STORAGE_KEYS.ROUTES, JSON.stringify(routes));
+      }
+      this.notify();
+    }
+  }
+
+  private handleRemoteTrip(routeId: string, data: any): void {
+    if (!data) return;
+    const routes = this.getRoutes();
+    const idx = routes.findIndex((r) => r.id === routeId);
+    if (idx !== -1) {
+      if (data.action === 'start') {
+        routes[idx].status = 'active';
+        if (data.driverName) routes[idx].driver.name = data.driverName;
+        if (data.phone) routes[idx].driver.phone = data.phone;
+        routes[idx].lastUpdated = 'Live trip active';
+      } else if (data.action === 'stop') {
+        routes[idx].status = 'completed';
+        routes[idx].speedKmH = 0;
+        routes[idx].lastUpdated = 'Trip concluded';
+      }
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(STORAGE_KEYS.ROUTES, JSON.stringify(routes));
+      }
+      this.notify();
+    }
+  }
+
+  private handleRemoteSos(data: any): void {
+    if (!data || !data.id) return;
+    const alerts = this.getSOSAlerts();
+    if (!alerts.some((a) => a.id === data.id)) {
+      alerts.unshift(data);
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(STORAGE_KEYS.SOS_ALERTS, JSON.stringify(alerts));
+      }
+      this.notify();
     }
   }
 
@@ -4208,6 +4333,12 @@ class BusStore {
       if (phone) routes[idx].driver.phone = phone;
       routes[idx].lastUpdated = 'Trip started just now';
       this.saveRoutes(routes);
+
+      this.publishCloud(`${TOPIC_TRIP}${routeId}`, {
+        action: 'start',
+        driverName,
+        phone
+      });
     }
   }
 
@@ -4216,8 +4347,13 @@ class BusStore {
     const idx = routes.findIndex((r) => r.id === routeId);
     if (idx !== -1) {
       routes[idx].status = 'completed';
+      routes[idx].speedKmH = 0;
       routes[idx].lastUpdated = 'Trip completed';
       this.saveRoutes(routes);
+
+      this.publishCloud(`${TOPIC_TRIP}${routeId}`, {
+        action: 'stop'
+      });
     }
   }
 
@@ -4229,8 +4365,17 @@ class BusStore {
       routes[idx].currentLocation = newLocation;
       if (typeof speed === 'number') routes[idx].speedKmH = speed;
       if (typeof heading === 'number') routes[idx].heading = heading;
-      routes[idx].lastUpdated = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      routes[idx].lastUpdated = timeStr;
       this.saveRoutes(routes);
+
+      // Instantly broadcast satellite GPS to all students and dispatchers across the internet
+      this.publishCloud(`${TOPIC_GPS}${routeId}`, {
+        location: newLocation,
+        speed,
+        heading,
+        timestamp: timeStr
+      });
     }
   }
 
@@ -4256,6 +4401,10 @@ class BusStore {
     alerts.unshift(newAlert);
     localStorage.setItem(STORAGE_KEYS.SOS_ALERTS, JSON.stringify(alerts));
     this.notify();
+
+    // Broadcast SOS alert to transport administration desks across the internet
+    this.publishCloud(`${TOPIC_SOS}new`, newAlert);
+
     return newAlert;
   }
 
