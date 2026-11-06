@@ -39,7 +39,14 @@ export default function BusQrTripStarter({
   onClose,
   onTripStarted
 }: BusQrTripStarterProps) {
-  const routes = busStore.getRoutes();
+  const [routes, setRoutes] = useState<BusRoute[]>(() => busStore.getRoutes());
+
+  useEffect(() => {
+    const unsub = busStore.subscribe(() => {
+      setRoutes(busStore.getRoutes());
+    });
+    return unsub;
+  }, []);
 
   // Selected route state (defaults to scanned route or first route)
   const [selectedRouteId, setSelectedRouteId] = useState<string>(() => {
@@ -47,7 +54,9 @@ export default function BusQrTripStarter({
       const match = routes.find(
         (r) =>
           r.id.toLowerCase() === initialRouteId.toLowerCase() ||
-          r.routeNumber.toLowerCase() === initialRouteId.toLowerCase()
+          r.routeNumber.toLowerCase() === initialRouteId.toLowerCase() ||
+          r.id.replace(/\D/g, '') === initialRouteId.replace(/\D/g, '') ||
+          r.routeNumber.replace(/\D/g, '') === initialRouteId.replace(/\D/g, '')
       );
       if (match) return match.id;
     }
@@ -56,8 +65,8 @@ export default function BusQrTripStarter({
 
   const route = routes.find((r) => r.id === selectedRouteId) || routes[0];
 
-  // 1. Driver Name state (asked when scanning QR)
-  const [driverName, setDriverName] = useState<string>(route?.driver?.name || '');
+  // 1. Driver Name state (prompted when scanning QR)
+  const [driverName, setDriverName] = useState<string>('');
   const [driverPhone, setDriverPhone] = useState<string>(route?.driver?.phone || '+91 94441 55012');
 
   // Search/Filter for route numbers
@@ -88,13 +97,26 @@ export default function BusQrTripStarter({
   // Watch ID for real device GPS
   const watchIdRef = useRef<number | null>(null);
 
+  // Sync when initialRouteId prop changes
+  useEffect(() => {
+    if (initialRouteId) {
+      const match = routes.find(
+        (r) =>
+          r.id.toLowerCase() === initialRouteId.toLowerCase() ||
+          r.routeNumber.toLowerCase() === initialRouteId.toLowerCase() ||
+          r.id.replace(/\D/g, '') === initialRouteId.replace(/\D/g, '') ||
+          r.routeNumber.replace(/\D/g, '') === initialRouteId.replace(/\D/g, '')
+      );
+      if (match) {
+        setSelectedRouteId(match.id);
+        setQrScannedBanner(`Scanned Bus QR: ${match.routeNumber}`);
+      }
+    }
+  }, [initialRouteId]);
+
   // Update driver details when route selection changes
   useEffect(() => {
     if (route) {
-      // If driver name is still default or empty, prefill from route directory
-      if (!driverName || routes.some((r) => r.driver.name === driverName)) {
-        setDriverName(route.driver.name);
-      }
       setDriverPhone(route.driver.phone);
       setIsBroadcasting(route.status === 'active');
       if (route.currentLocation) {
@@ -622,20 +644,20 @@ export default function BusQrTripStarter({
                   required
                   value={driverName}
                   onChange={(e) => setDriverName(e.target.value)}
-                  placeholder="Enter Driver's Full Name (e.g. M. Shanmugam)"
+                  placeholder={`Enter Driver's Full Name (e.g. ${route.driver.name})`}
                   className="w-full pl-9 pr-3 py-2.5 rounded-xl border border-slate-700 bg-slate-900 text-white text-sm font-bold placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-amber-500/30 focus:border-amber-500"
                 />
               </div>
 
               <div className="flex items-center justify-between text-[11px] text-slate-400 pt-1">
                 <span>Shown to waiting students and parent tracking</span>
-                {route.driver.name && driverName !== route.driver.name && (
+                {route.driver.name && (
                   <button
                     type="button"
                     onClick={() => setDriverName(route.driver.name)}
                     className="text-amber-400 hover:underline font-bold"
                   >
-                    Reset to {route.driver.name}
+                    Use assigned: {route.driver.name}
                   </button>
                 )}
               </div>
